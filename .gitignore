@@ -205,9 +205,28 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-# custom
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.log
+
+# ===== Virtual environments =====
+.venv/
+venv/
+env/
+
+# ===== Secrets / tokens =====
+*.env
+token.txt
+
+# ===== OS-specific =====
+.DS_Store
+Thumbs.db
+
+# ===== CSV exports =====
 *.csv
 *.xlsx
 *.zip
-token.txt
-.env
