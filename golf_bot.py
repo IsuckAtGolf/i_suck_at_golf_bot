@@ -1,9 +1,8 @@
-# I_suck_at_golf — Telegram bot
-# Background Worker friendly. No web server. Long-polling only.
+# I_suck_at_golf — Telegram bot (Background Worker, long-polling)
 # Requires: python-telegram-bot==21.3
 
 import os, sys, traceback, platform, io, csv, uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from collections import defaultdict, Counter
 from datetime import datetime
 
@@ -25,12 +24,11 @@ if not TOKEN:
 
 BOT_NAME = "I_suck_at_golf"
 
-# ======= CONSTANTS / LABELS =======
+# ======= CONSTANTS =======
 ARW_UP, ARW_DOWN, ARW_RIGHT, ARW_LEFT = "⬆️", "⬇️", "➡️", "⬅️"
 CHECK, CROSS = "✅", "❌"
 BACK, CANCEL, CONFIRM = "⬅ Back", "✖ Cancel", "✅ Confirm"
 
-# Lie & Clubs (as requested)
 LIES = ["tee", "fairway", "rough", "deep rough", "fringe", "green", "sand", "mat", "bare lie", "divot"]
 CLUBS = ["Dr", "3w", "5w", "7w", "3h", "3", "4", "5", "6", "7", "8", "9",
          "GW", "PW", "SW", "LW", "54", "56", "58", "60", "Putter"]
@@ -41,18 +39,16 @@ SHOT_TYPES = [
     "bump and run", "flop shot", "putt"
 ]
 
-# Non-putt steps
 RESULT_NON_PUTT = [ARW_UP, ARW_DOWN, ARW_RIGHT, ARW_LEFT, f"{CHECK}"]
 CONTACT_NON_PUTT = ["thin", "fat", "toe", "heel", "shank", "high on face", "low on face", f"good {CHECK}"]
 PLAN_CHOICES = [f"shot as planned {CHECK}", f"not as planned {CROSS}"]
 
-# Putt steps
 PUTT_DISTANCE = ["Long putt", "Short putt"]
 RESULT_PUTT = [ARW_UP, ARW_DOWN, ARW_RIGHT, ARW_LEFT, f"{CHECK}"]
 CONTACT_PUTT = ["toe", "heel", f"good {CHECK}"]
 LAG_PUTT = ["good reading", "poor reading"]
 
-# ======= DATA MODELS =======
+# ======= DATA =======
 @dataclass
 class Shot:
     timestamp: str
@@ -66,12 +62,12 @@ class Shot:
 
     shot_type: str | None = None
 
-    # non-putt path
+    # non-putt
     result: str | None = None
     contact: str | None = None
     plan: str | None = None
 
-    # putt path
+    # putt
     putt_distance: str | None = None
     putt_result: str | None = None
     putt_contact: str | None = None
@@ -98,28 +94,31 @@ RAW_HEADER = [
 
 # ======= HELPERS =======
 def kb(rows): return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
-
 def now_iso(): return datetime.now().isoformat(timespec="seconds")
-
 def pct(a, b): return 0.0 if not b else round(a * 100.0 / b, 1)
+def club_name(c: str | None) -> str: return c or "—"
 
 def ensure_session(ctx: ContextTypes.DEFAULT_TYPE):
-    """Initialize per-user state buckets."""
     if "core" not in ctx.user_data:
         ctx.user_data["core"] = {}
     core = ctx.user_data["core"]
     core.setdefault("session_id", str(uuid.uuid4()))
-    core.setdefault("mode", None)             # "practice" / "oncourse"
-    core.setdefault("shots", [])              # list[Shot] for current session
-    core.setdefault("current", None)          # building Shot
-    core.setdefault("stack", [])              # back stack (snapshots)
+    core.setdefault("mode", None)              # "practice" / "oncourse"
+    core.setdefault("shots", [])               # list[Shot]
+    core.setdefault("current", None)           # building Shot
+    core.setdefault("stack", [])               # back snapshots
     core.setdefault("practice", {"lie": None, "club": None})
     core.setdefault("round", {"hole": 1})
     return core
 
 def start_new_shot(core):
     s = Shot(timestamp=now_iso(), mode=core["mode"], session_id=core["session_id"])
+    if core["mode"] == "on course":
+        # нормализуем внутреннее обозначение
+        core["mode"] = "on course"  # оставлено совпадением с UI
     if core["mode"] == "oncourse":
+        s.hole = core["round"]["hole"]
+    elif core["mode"] == "on course":
         s.hole = core["round"]["hole"]
     if core["mode"] == "practice":
         s.lie = core["practice"]["lie"]
@@ -128,8 +127,7 @@ def start_new_shot(core):
     core["stack"] = []
 
 def push_state(core):
-    snap = asdict(core["current"])
-    core["stack"].append(snap)
+    core["stack"].append(asdict(core["current"]))
 
 def pop_state(core):
     if core["stack"]:
@@ -138,7 +136,7 @@ def pop_state(core):
         return True
     return False
 
-def summarize_shot(s: Shot) -> str:
+def summarize(s: Shot) -> str:
     lines = [f"Mode: {s.mode}"]
     if s.hole: lines.append(f"Hole: {s.hole}")
     if s.lie: lines.append(f"Lie: {s.lie}")
@@ -159,55 +157,47 @@ def summarize_shot(s: Shot) -> str:
 
     return "\n".join(lines)
 
-def club_basename(c: str | None) -> str:
-    return c or "—"
-
 # ======= KEYBOARDS =======
 def kb_mode(): return kb([["practice", "on course"]])
-
 def kb_lie():
     rows = [LIES[i:i+3] for i in range(0, len(LIES), 3)]
     rows += [[BACK]]
     return kb(rows)
-
 def kb_club():
     rows = [CLUBS[i:i+5] for i in range(0, len(CLUBS), 5)]
     rows += [[BACK]]
     return kb(rows)
-
 def kb_type():
     rows = [SHOT_TYPES[i:i+3] for i in range(0, len(SHOT_TYPES), 3)]
     rows += [[BACK]]
     return kb(rows)
-
-def kb_result(is_putt: bool):
+def kb_result(is_putt=False):
     src = RESULT_PUTT if is_putt else RESULT_NON_PUTT
     rows = [src[i:i+3] for i in range(0, len(src), 3)]
     rows += [[BACK]]
     return kb(rows)
-
-def kb_contact(is_putt: bool):
+def kb_contact(is_putt=False):
     src = CONTACT_PUTT if is_putt else CONTACT_NON_PUTT
     rows = [src[i:i+3] for i in range(0, len(src), 3)]
     rows += [[BACK]]
     return kb(rows)
+def kb_plan(): return kb([PLAN_CHOICES, [BACK]])
+def kb_putt_distance(): return kb([PUTT_DISTANCE, [BACK]])
+def kb_lag(): return kb([LAG_PUTT, [BACK]])
+def kb_confirm(): return kb([[CONFIRM, CANCEL], [BACK]])
 
-def kb_plan():
-    rows = [PLAN_CHOICES, [BACK]]
-    return kb(rows)
+# ======= COMMANDS =======
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "I_suck_at_golf — commands:\n"
+        "/start — choose mode\n"
+        "/shot — (on course) start a shot\n"
+        "/next_hole — go to next hole\n"
+        "/stats — CSV stats (percent per club, current session)\n"
+        "/end_session — reset session\n"
+        "/help — this help"
+    )
 
-def kb_putt_distance():
-    rows = [PUTT_DISTANCE, [BACK]]
-    return kb(rows)
-
-def kb_lag():
-    rows = [LAG_PUTT, [BACK]]
-    return kb(rows)
-
-def kb_confirm():
-    return kb([[CONFIRM, CANCEL], [BACK]])
-
-# ======= HANDLERS =======
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
     await update.message.reply_text(
@@ -221,30 +211,29 @@ async def handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text not in ["practice", "on course"]:
         return await update.message.reply_text("Choose mode:", reply_markup=kb_mode())
 
-    # new session id per mode selection
-    core["mode"] = text
+    # start a fresh session
+    core["mode"] = text if text != "on course" else "oncourse"
     core["session_id"] = str(uuid.uuid4())
     core["shots"] = []
     core["current"] = None
     core["stack"] = []
 
-    if text == "practice":
+    if core["mode"] == "practice":
         core["practice"] = {"lie": None, "club": None}
-        return await update.message.reply_text("Practice mode selected.\nPick Lie:", reply_markup=kb_lie())
+        return await update.message.reply_text("Practice selected.\nPick Lie:", reply_markup=kb_lie())
     else:
         core["round"] = {"hole": 1}
         return await update.message.reply_text(
-            "On-course mode selected.\nHole = 1.\nStart a shot with /shot\nUse /next_hole to advance hole.",
+            "On-course selected.\nHole = 1.\nStart a shot with /shot\nUse /next_hole to advance hole.",
             reply_markup=ReplyKeyboardRemove()
         )
 
-# ---- Practice setup (sticky Lie & Club) ----
+# ---- Practice sticky setup ----
 async def handle_practice_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
     if core["mode"] != "practice": return
     text = update.message.text
 
-    # LIE
     if core["practice"]["lie"] is None:
         if text == BACK:
             return await update.message.reply_text("Choose mode:", reply_markup=kb_mode())
@@ -253,43 +242,42 @@ async def handle_practice_setup(update: Update, context: ContextTypes.DEFAULT_TY
             return await update.message.reply_text(f"Lie: {text}\nNow pick Club:", reply_markup=kb_club())
         return await update.message.reply_text("Pick Lie:", reply_markup=kb_lie())
 
-    # CLUB
     if core["practice"]["club"] is None:
         if text == BACK:
             core["practice"]["lie"] = None
             return await update.message.reply_text("Pick Lie:", reply_markup=kb_lie())
         if text in CLUBS:
             core["practice"]["club"] = text
-            start_new_shot(core)  # prefill with sticky values
+            start_new_shot(core)  # prefill sticky
             return await update.message.reply_text(
                 f"Sticky set ✅\nLie: {core['practice']['lie']} | Club: {core['practice']['club']}\nStart a shot: choose Type",
                 reply_markup=kb_type()
             )
         return await update.message.reply_text("Pick Club:", reply_markup=kb_club())
 
-    # both set → enter shot flow
+    # both set → proceed to flow
     await shot_flow(update, context)
 
 # ---- On-course helpers ----
 async def cmd_shot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
-    if core["mode"] != "on course":
+    if core["mode"] != "oncourse":
         return await update.message.reply_text("You are not in on-course mode. Use /start.")
     start_new_shot(core)
     await update.message.reply_text(f"Hole {core['round']['hole']}: choose Type", reply_markup=kb_type())
 
 async def cmd_next_hole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
-    if core["mode"] != "on course":
+    if core["mode"] != "oncourse":
         return await update.message.reply_text("You are not in on-course mode.")
     core["round"]["hole"] += 1
     await update.message.reply_text(f"Moved to hole {core['round']['hole']}. Add a shot: /shot")
 
-# ---- Stats / Session control ----
+# ---- Stats / CSV ----
 def compute_stats_by_club(shots: list[Shot]):
     by_club = defaultdict(list)
     for s in shots:
-        by_club[club_basename(s.club)].append(s)
+        by_club[club_name(s.club)].append(s)
 
     result_keys = list(dict.fromkeys(RESULT_NON_PUTT + RESULT_PUTT))
     contact_keys = list(dict.fromkeys([*CONTACT_NON_PUTT, *CONTACT_PUTT]))
@@ -320,7 +308,6 @@ def compute_stats_by_club(shots: list[Shot]):
                 if s.plan:    plan.append(s.plan)
 
         rc, cc, pc, lc = Counter(res), Counter(con), Counter(plan), Counter(lag)
-
         row = [club, N] \
             + [pct(rc.get(k, 0), N) for k in result_keys] \
             + [pct(cc.get(k, 0), N) for k in contact_keys] \
@@ -348,7 +335,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("No shots yet in this session.")
     rows = compute_stats_by_club(core["shots"])
     stats_file = csv_bytes_from_rows(rows); stats_file.name = "stats_by_club.csv"
-    raw_file = raw_csv_bytes(core["shots"]); raw_file.name = "raw_shots.csv"
+    raw_file = raw_csv_bytes(core["shots"]);  raw_file.name = "raw_shots.csv"
 
     await update.message.reply_text(
         "Statistics are percentages per club within the current session.\n"
@@ -358,7 +345,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(InputFile(raw_file))
 
 async def cmd_end_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Optional: вручную завершить текущую сессию и начать новую."""
     core = ensure_session(context)
     core["session_id"] = str(uuid.uuid4())
     core["shots"] = []
@@ -367,26 +353,28 @@ async def cmd_end_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if core["mode"] == "practice":
         core["practice"] = {"lie": None, "club": None}
         return await update.message.reply_text("Session reset. Practice setup: pick Lie.", reply_markup=kb_lie())
-    else:
+    elif core["mode"] == "oncourse":
         core["round"] = {"hole": 1}
         return await update.message.reply_text("Session reset. On-course: Hole = 1. Use /shot.")
+    else:
+        return await update.message.reply_text("Session reset. Use /start to choose mode.")
 
-# ---- Common shot flow (both modes) ----
+# ---- Common shot flow ----
 async def shot_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
     s: Shot | None = core["current"]
 
-    # Prepare for practice if sticky set already
+    # prepare for practice quick flow
     if s is None:
         if core["mode"] == "practice":
             if core["practice"]["lie"] and core["practice"]["club"]:
-                start_new_shot(core)
-                s = core["current"]
+                start_new_shot(core); s = core["current"]
             else:
-                # still in practice setup
-                return
-        else:
+                return  # still in sticky setup
+        elif core["mode"] == "oncourse":
             return await update.message.reply_text("Start a shot with /shot")
+        else:
+            return await update.message.reply_text("Use /start to choose mode.")
 
     text = update.message.text
 
@@ -410,19 +398,19 @@ async def shot_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         core["current"] = None
         core["stack"] = []
         if core["mode"] == "practice":
-            start_new_shot(core)  # quick next
+            start_new_shot(core)
             return await update.message.reply_text("Saved ✅\nNew shot: choose Type", reply_markup=kb_type())
         return await update.message.reply_text("Saved ✅\nAdd next: /shot", reply_markup=ReplyKeyboardRemove())
 
-    # --- Progress steps ---
+    # Progression
     # Type
     if s.shot_type is None:
         if text in SHOT_TYPES:
-            push_state(core)
+            core["stack"].append(asdict(s))
             s.shot_type = text
             if s.shot_type == "putt":
                 return await update.message.reply_text("Distance?", reply_markup=kb_putt_distance())
-            # non-putt: ensure lie/club known
+            # non-putt: ensure lie/club
             if s.lie is None:
                 return await update.message.reply_text("Lie?", reply_markup=kb_lie())
             if s.club is None:
@@ -434,36 +422,35 @@ async def shot_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if s.shot_type != "putt":
         if s.lie is None:
             if text in LIES:
-                push_state(core); s.lie = text
+                core["stack"].append(asdict(s)); s.lie = text
                 return await update.message.reply_text("Club?", reply_markup=kb_club())
             return await update.message.reply_text("Lie?", reply_markup=kb_lie())
         if s.club is None:
             if text in CLUBS:
-                push_state(core); s.club = text
+                core["stack"].append(asdict(s)); s.club = text
                 return await update.message.reply_text("Result?", reply_markup=kb_result(False))
             return await update.message.reply_text("Club?", reply_markup=kb_club())
         if s.result is None:
             if text in RESULT_NON_PUTT:
-                push_state(core); s.result = text
+                core["stack"].append(asdict(s)); s.result = text
                 return await update.message.reply_text("Contact?", reply_markup=kb_contact(False))
             return await update.message.reply_text("Result?", reply_markup=kb_result(False))
         if s.contact is None:
             if text in CONTACT_NON_PUTT:
-                push_state(core); s.contact = text
+                core["stack"].append(asdict(s)); s.contact = text
                 return await update.message.reply_text("Plan?", reply_markup=kb_plan())
             return await update.message.reply_text("Contact?", reply_markup=kb_contact(False))
         if s.plan is None:
             if text in PLAN_CHOICES:
-                push_state(core); s.plan = text
-                summary = summarize_shot(s)
-                return await update.message.reply_text(f"Review:\n{summary}", reply_markup=kb_confirm())
+                core["stack"].append(asdict(s)); s.plan = text
+                return await update.message.reply_text(f"Review:\n{summarize(s)}", reply_markup=kb_confirm())
             return await update.message.reply_text("Plan?", reply_markup=kb_plan())
 
     # Putt branch
     else:
         if s.putt_distance is None:
             if text in PUTT_DISTANCE:
-                push_state(core); s.putt_distance = text
+                core["stack"].append(asdict(s)); s.putt_distance = text
                 if s.lie is None:
                     return await update.message.reply_text("Lie?", reply_markup=kb_lie())
                 if s.club is None:
@@ -472,52 +459,50 @@ async def shot_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Distance?", reply_markup=kb_putt_distance())
         if s.lie is None:
             if text in LIES:
-                push_state(core); s.lie = text
+                core["stack"].append(asdict(s)); s.lie = text
                 return await update.message.reply_text("Club?", reply_markup=kb_club())
             return await update.message.reply_text("Lie?", reply_markup=kb_lie())
         if s.club is None:
             if text in CLUBS:
-                push_state(core); s.club = text
+                core["stack"].append(asdict(s)); s.club = text
                 return await update.message.reply_text("Result?", reply_markup=kb_result(True))
             return await update.message.reply_text("Club?", reply_markup=kb_club())
         if s.putt_result is None:
             if text in RESULT_PUTT:
-                push_state(core); s.putt_result = text
+                core["stack"].append(asdict(s)); s.putt_result = text
                 return await update.message.reply_text("Contact?", reply_markup=kb_contact(True))
             return await update.message.reply_text("Result?", reply_markup=kb_result(True))
         if s.putt_contact is None:
             if text in CONTACT_PUTT:
-                push_state(core); s.putt_contact = text
+                core["stack"].append(asdict(s)); s.putt_contact = text
                 return await update.message.reply_text("Plan?", reply_markup=kb_plan())
             return await update.message.reply_text("Contact?", reply_markup=kb_contact(True))
         if s.putt_plan_1 is None:
             if text in PLAN_CHOICES:
-                push_state(core); s.putt_plan_1 = text
+                core["stack"].append(asdict(s)); s.putt_plan_1 = text
                 return await update.message.reply_text("Lag putt reading?", reply_markup=kb_lag())
             return await update.message.reply_text("Plan?", reply_markup=kb_plan())
         if s.lag_reading is None:
             if text in LAG_PUTT:
-                push_state(core); s.lag_reading = text
+                core["stack"].append(asdict(s)); s.lag_reading = text
                 return await update.message.reply_text("Plan (after lag)?", reply_markup=kb_plan())
             return await update.message.reply_text("Lag putt reading?", reply_markup=kb_lag())
         if s.putt_plan_2 is None:
             if text in PLAN_CHOICES:
-                push_state(core); s.putt_plan_2 = text
-                summary = summarize_shot(s)
-                return await update.message.reply_text(f"Review:\n{summary}", reply_markup=kb_confirm())
+                core["stack"].append(asdict(s)); s.putt_plan_2 = text
+                return await update.message.reply_text(f"Review:\n{summarize(s)}", reply_markup=kb_confirm())
             return await update.message.reply_text("Plan (after lag)?", reply_markup=kb_plan())
 
 async def reask_step(update: Update, s: Shot):
     if s.shot_type is None:
         return await update.message.reply_text("Choose Type:", reply_markup=kb_type())
-
     if s.shot_type != "putt":
         if s.lie is None:   return await update.message.reply_text("Lie?", reply_markup=kb_lie())
         if s.club is None:  return await update.message.reply_text("Club?", reply_markup=kb_club())
         if s.result is None:return await update.message.reply_text("Result?", reply_markup=kb_result(False))
         if s.contact is None:return await update.message.reply_text("Contact?", reply_markup=kb_contact(False))
         if s.plan is None: return await update.message.reply_text("Plan?", reply_markup=kb_plan())
-        return await update.message.reply_text(f"Review:\n{summarize_shot(s)}", reply_markup=kb_confirm())
+        return await update.message.reply_text(f"Review:\n{summarize(s)}", reply_markup=kb_confirm())
     else:
         if s.putt_distance is None: return await update.message.reply_text("Distance?", reply_markup=kb_putt_distance())
         if s.lie is None:           return await update.message.reply_text("Lie?", reply_markup=kb_lie())
@@ -527,34 +512,30 @@ async def reask_step(update: Update, s: Shot):
         if s.putt_plan_1 is None:   return await update.message.reply_text("Plan?", reply_markup=kb_plan())
         if s.lag_reading is None:   return await update.message.reply_text("Lag putt reading?", reply_markup=kb_lag())
         if s.putt_plan_2 is None:   return await update.message.reply_text("Plan (after lag)?", reply_markup=kb_plan())
-        return await update.message.reply_text(f"Review:\n{summarize_shot(s)}", reply_markup=kb_confirm())
+        return await update.message.reply_text(f"Review:\n{summarize(s)}", reply_markup=kb_confirm())
 
-# ---- Router for plain text ----
+# ---- Router ----
 async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
     if core["mode"] is None:
         return await handle_mode(update, context)
-
     if core["mode"] == "practice":
         if core["practice"]["lie"] is None or core["practice"]["club"] is None:
             return await handle_practice_setup(update, context)
         return await shot_flow(update, context)
-
-    if core["mode"] == "on course":
+    if core["mode"] == "oncourse":
         return await shot_flow(update, context)
+    return await update.message.reply_text("Use /start to choose mode.")
 
 # ======= MAIN =======
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # commands
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("shot", cmd_shot))
     app.add_handler(CommandHandler("next_hole", cmd_next_hole))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("end_session", cmd_end_session))
-
-    # any text (menus)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
 
     try:
