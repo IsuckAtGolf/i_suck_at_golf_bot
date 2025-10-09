@@ -36,9 +36,12 @@ CHECK, CROSS = "⛳️", "❌"
 # Кнопка подтверждения оставляем с ✅
 BACK, CANCEL, CONFIRM = "⬅ Back", "✖ Cancel", "✅ Confirm"
 
-# Новые универсальные кнопки
+# Универсальные кнопки
 MAIN_MENU = "🏠 Main menu"
 END_SESSION_BTN = "🛑 End session"
+
+# Для подтверждения отправки статистики (по запросу пользователя)
+YES_MARK, NO_MARK = "✅", "❌"
 
 # Lie / Club
 LIES = ["tee", "fairway", "rough", "deep rough", "fringe", "green", "sand", "mat", "bare lie", "divot"]
@@ -123,6 +126,7 @@ def ensure_session(ctx: ContextTypes.DEFAULT_TYPE):
     core.setdefault("stack", [])               # back snapshots
     core.setdefault("practice", {"lie": None, "club": None})
     core.setdefault("round", {"hole": 1})
+    core.setdefault("awaiting_end_stats", False) # ждём подтверждение выгрузки статистики?
     return core
 
 def start_new_shot(core):
@@ -176,6 +180,7 @@ async def go_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core["stack"] = []
     core["practice"] = {"lie": None, "club": None}
     core["round"] = {"hole": 1}
+    core["awaiting_end_stats"] = False
     await update.message.reply_text(
         f"Hi! This is {BOT_NAME}.\nChoose mode:",
         reply_markup=kb_mode()
@@ -188,6 +193,7 @@ async def end_session_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     core["shots"] = []
     core["current"] = None
     core["stack"] = []
+    core["awaiting_end_stats"] = False
     if core["mode"] == "practice":
         core["practice"] = {"lie": None, "club": None}
         await update.message.reply_text("Session ended. Practice setup: pick Lie.", reply_markup=kb_lie())
@@ -197,13 +203,61 @@ async def end_session_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("Session ended. Use /start to choose mode.", reply_markup=kb_mode())
 
+async def send_stats_files(update: Update, shots: list[Shot]):
+    """Отправка двух CSV как при /stats."""
+    if not shots:
+        await update.message.reply_text("No shots in this session — nothing to export.")
+        return
+    rows = compute_stats_by_club(shots)
+    stats_file = csv_bytes_from_rows(rows); stats_file.name = "stats_by_club.csv"
+    raw_file = raw_csv_bytes(shots);        raw_file.name  = "raw_shots.csv"
+
+    await update.message.reply_text(
+        "Statistics are percentages per club within the current session.\n"
+        "Sending two CSVs for Google Sheets:"
+    )
+    await update.message.reply_document(InputFile(stats_file))
+    await update.message.reply_document(InputFile(raw_file))
+
+async def ask_end_session_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Задать вопрос: прислать ли статистику перед завершением сессии."""
+    core = ensure_session(context)
+    core["awaiting_end_stats"] = True
+    await update.message.reply_text(
+        "Do you want to receive statistics files for this session before ending?",
+        reply_markup=kb_end_stats_confirm()
+    )
+
+async def handle_end_session_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Обработка ответа на вопрос о статистике. Возвращает True, если обработано."""
+    core = ensure_session(context)
+    if not core.get("awaiting_end_stats"):
+        return False
+
+    if text == YES_MARK:
+        # отправляем файлы и завершаем сессию
+        await send_stats_files(update, core["shots"])
+        await end_session_action(update, context)
+        return True
+    elif text == NO_MARK:
+        # просто завершаем сессию
+        await end_session_action(update, context)
+        return True
+    else:
+        # повторим вопрос
+        await update.message.reply_text(
+            "Please tap ✅ to receive statistics first, or ❌ to end without stats.",
+            reply_markup=kb_end_stats_confirm()
+        )
+        return True
+
 async def handle_controls(text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Обработка управляющих кнопок. True если обработано."""
     if text == MAIN_MENU:
         await go_main_menu(update, context)
         return True
     if text == END_SESSION_BTN:
-        await end_session_action(update, context)
+        await ask_end_session_stats(update, context)
         return True
     return False
 
@@ -211,7 +265,6 @@ async def handle_controls(text: str, update: Update, context: ContextTypes.DEFAU
 def kb_mode(): return kb([["practice", "on course"]])
 
 def kb_with_controls(rows: list[list[str]]):
-    # Добавляем общий ряд управления в любой экран шага
     rows = list(rows)
     rows += [[BACK, MAIN_MENU], [END_SESSION_BTN]]
     return kb(rows)
@@ -251,9 +304,12 @@ def kb_lag():
     return kb_with_controls(rows)
 
 def kb_confirm():
-    # Confirm оставляем с ✅, но управление тоже доступно
     rows = [[CONFIRM, CANCEL]]
     return kb_with_controls(rows)
+
+def kb_end_stats_confirm():
+    # Подтверждение отправки статистики: ✅ / ❌
+    return kb([[YES_MARK, NO_MARK]])
 
 # ======= COMMANDS =======
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,7 +319,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/shot — (on course) start a shot\n"
         "/next_hole — go to next hole\n"
         "/stats — CSV stats (percent per club, current session)\n"
-        "/end_session — end current session\n"
+        "/end_session — end session (will ask if you want stats)\n"
         "/help — this help"
     )
 
@@ -285,6 +341,7 @@ async def handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core["shots"] = []
     core["current"] = None
     core["stack"] = []
+    core["awaiting_end_stats"] = False
 
     if core["mode"] == "practice":
         core["practice"] = {"lie": None, "club": None}
@@ -301,6 +358,11 @@ async def handle_practice_setup(update: Update, context: ContextTypes.DEFAULT_TY
     core = ensure_session(context)
     if core["mode"] != "practice": return
     text = update.message.text
+
+    # Сначала проверим, не выбирает ли пользователь статистику для end session
+    if core.get("awaiting_end_stats"):
+        handled = await handle_end_session_choice(update, context, text)
+        if handled: return
 
     # Управляющие кнопки
     if await handle_controls(text, update, context):
@@ -419,12 +481,19 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(InputFile(raw_file))
 
 async def cmd_end_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await end_session_action(update, context)
+    # Вместо мгновенного завершения — спросим про статистику
+    await ask_end_session_stats(update, context)
 
 # ---- Common shot flow ----
 async def shot_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
     s: Shot | None = core["current"]
+
+    # Если ждём ответ по статистике — обрабатываем его прежде всего
+    text = update.message.text
+    if core.get("awaiting_end_stats"):
+        handled = await handle_end_session_choice(update, context, text)
+        if handled: return
 
     # Подготовка для practice (быстрые подряд удары)
     if s is None:
@@ -437,8 +506,6 @@ async def shot_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Start a shot with /shot")
         else:
             return await update.message.reply_text("Use /start to choose mode.")
-
-    text = update.message.text
 
     # Управляющие кнопки
     if await handle_controls(text, update, context):
@@ -583,6 +650,11 @@ async def reask_step(update: Update, s: Shot):
 async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     core = ensure_session(context)
     text = update.message.text
+
+    # Если ждём ответ по статистике — обрабатываем сразу
+    if core.get("awaiting_end_stats"):
+        handled = await handle_end_session_choice(update, context, text)
+        if handled: return
 
     # Управляющие кнопки доступны всегда
     if await handle_controls(text, update, context):
